@@ -1,0 +1,5 @@
+# Never publish raw (unencrypted) data — only the encrypted index.html
+concentrated_tracker.html
+concentrated_holdings.json
+__pycache__/
+*.pyc
