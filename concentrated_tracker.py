@@ -159,7 +159,7 @@ def scrape_manager_list():
 
 
 def scrape_manager(mgr_id, mgr_name):
-    """Return list of positions: [{ticker, company, pct}] for a manager."""
+    """Return list of positions: [{ticker, company, pct, value}] for a manager."""
     url = f"{BASE_URL}/m/holdings.php?m={mgr_id}"
     try:
         html = _dr.get(url, timeout=20).text
@@ -167,12 +167,16 @@ def scrape_manager(mgr_id, mgr_name):
         table = soup.find("table", id="grid") or soup.find("table")
         if not table:
             return []
+        # Map header names -> column index (robust to column shifts)
+        header = table.find("tr")
+        cols = [c.get_text(strip=True).lower() for c in header.find_all(["th", "td"])]
+        pct_i = next((i for i, c in enumerate(cols) if "portfolio" in c), 2)
+        val_i = next((i for i, c in enumerate(cols) if c == "value" or c.startswith("value")), None)
         positions = []
         for row in table.find_all("tr")[1:]:
             tds = row.find_all("td")
             if len(tds) < 3:
                 continue
-            # ticker + company from the stock cell (2nd data col)
             sym, company = None, ""
             for a in row.find_all("a"):
                 if "stock.php?sym=" in a.get("href", ""):
@@ -181,14 +185,17 @@ def scrape_manager(mgr_id, mgr_name):
             stock_text = tds[1].get_text(" ", strip=True)  # "GOOGL - Alphabet Inc."
             if " - " in stock_text:
                 company = stock_text.split(" - ", 1)[1].strip()
-            # % of portfolio is the 3rd column
-            pct_text = tds[2].get_text(strip=True).replace("%", "")
+            pct_text = tds[pct_i].get_text(strip=True).replace("%", "") if pct_i < len(tds) else ""
             try:
                 pct = float(pct_text)
             except ValueError:
                 pct = None
+            value = None
+            if val_i is not None and val_i < len(tds):
+                v = re.sub(r"[^0-9]", "", tds[val_i].get_text(strip=True))
+                value = float(v) if v else None    # Dataroma "Value" is in $ (thousands? no — full $)
             if sym and 1 < len(sym) <= 7:
-                positions.append({"ticker": sym, "company": company, "pct": pct})
+                positions.append({"ticker": sym, "company": company, "pct": pct, "value": value})
         return positions
     except Exception as e:
         print(f"    ! {mgr_name}: {e}")
@@ -251,14 +258,19 @@ def scrape_valuesider_fund(slug):
         pm = re.search(r"What is ([^?]+?)'s portfolio", txt)
         person = pm.group(1).strip() if pm else ""
         name = f"{person} - {firm}" if person and person.lower() not in firm.lower() else firm
+        # total portfolio value -> used to derive each position's $ size
+        vm = re.search(r"portfolio value of \$([0-9,]+)", txt)
+        port_value = float(vm.group(1).replace(",", "")) if vm else None
         # top holdings summary: "(TICKER)</a> COMPANY NAME (NN.NN%)" in the HTML
         positions = []
         for tk, mid_txt, pct in re.findall(r"\(([A-Z0-9.\-]{1,6})\)([^(]*?)\(([0-9.]+)%\)", html):
             company = re.sub(r"<[^>]+>", "", mid_txt).strip(" ,-–").title()
+            pctf = float(pct)
             positions.append({
                 "ticker": tk.upper().strip(),
                 "company": company,
-                "pct": float(pct),
+                "pct": pctf,
+                "value": (port_value * pctf / 100.0) if port_value else None,
             })
         # de-dupe tickers, keep highest pct
         best = {}
@@ -343,6 +355,15 @@ def generate_html(rows, mgr_meta, elapsed):
         mc = r["mcap"]
         mc_str = f"${mc/1e9:,.2f}B" if mc >= 1e9 else f"${mc/1e6:,.0f}M"
         mc_val = round(mc / 1e6)
+        val = r.get("value")
+        if val:
+            val_str = (f"${val/1e9:,.2f}B" if val >= 1e9
+                       else f"${val/1e6:,.1f}M" if val >= 1e6
+                       else f"${val/1e3:,.0f}K")
+            val_val = round(val)
+        else:
+            val_str, val_val = "—", -1
+        val_est = ' <span class="est" title="Estimated from portfolio value × weight">~</span>' if (val and r.get("source") == "Valuesider") else ""
         star = '<span class="star" title="Big slice of the fund (≥10%)">★</span> ' if big else ""
         row_cls = ' class="big"' if big else ""
         src = r.get("source", "Dataroma")
@@ -352,12 +373,13 @@ def generate_html(rows, mgr_meta, elapsed):
         body += f"""
         <tr{row_cls} data-mgr="{r['manager'].lower()}" data-ticker="{r['ticker'].lower()}"
             data-holdings="{r['holdings']}" data-pct="{pct_val:.2f}" data-mcap="{mc_val}"
-            data-source="{src}" data-big="{1 if big else 0}">
+            data-source="{src}" data-value="{val_val}" data-big="{1 if big else 0}">
           <td class="mgr">{r['manager']} <span class="src {src_short.lower()}" title="{src_title}">{src_short}</span></td>
           <td class="ctr"><span class="badge">{r['holdings']}</span></td>
           <td><a class="tk" href="https://finance.yahoo.com/quote/{r['ticker']}" target="_blank">{r['ticker']}</a></td>
           <td class="name" title="{r['company']}">{r['company']}</td>
           <td class="ctr pct">{star}{pct_str}</td>
+          <td class="ctr">{val_str}{val_est}</td>
           <td class="ctr">{mc_str}</td>
           <td class="ctr links">
             <a href="{r['fund_url']}" target="_blank" title="{src_title}">{src_short}</a>
@@ -433,6 +455,7 @@ def generate_html(rows, mgr_meta, elapsed):
   .badge {{ background:rgba(88,166,255,.15); color:var(--blue); border:1px solid rgba(88,166,255,.3);
     padding:1px 9px; border-radius:10px; font-size:11px; font-weight:700; }}
   .star {{ color:var(--gold); }}
+  .est {{ color:var(--muted); font-size:11px; }}
   .links a {{ color:var(--muted); text-decoration:none; font-weight:700; font-size:11px;
     border:1px solid var(--border); border-radius:5px; padding:2px 6px; margin:0 2px; }}
   .links a:hover {{ color:var(--blue); border-color:var(--blue); }}
@@ -479,6 +502,7 @@ def generate_html(rows, mgr_meta, elapsed):
       <th data-s="ticker">Ticker</th>
       <th data-s="name">Company</th>
       <th class="ctr" data-s="pct">% of Fund</th>
+      <th class="ctr" data-s="value" title="Dollar size of the position at the latest 13F filing">$ Position</th>
       <th class="ctr" data-s="mcap">Market Cap</th>
       <th class="ctr">Links</th>
     </tr></thead>
@@ -490,7 +514,8 @@ def generate_html(rows, mgr_meta, elapsed):
 <div class="footer">
   <span class="src dr">DR</span> = Dataroma (full holdings) ·
   <span class="src vs">VS</span> = Valuesider-only fund, not on Dataroma (top holdings shown — a ≥{BIG_POSITION:.0f}% position is always a top holding) ·
-  Market caps from Yahoo Finance · Data from 13F filings · Generated {now} · Informational only — not investment advice.
+  <b>$ Position</b> = value at latest 13F (<span class="est">~</span> = estimated from portfolio value × weight for VS funds) ·
+  Market caps from Yahoo Finance · Generated {now} · Informational only — not investment advice.
 </div>
 
 <script>
@@ -515,9 +540,9 @@ function sort(k){{
   if(sk===k)sd*=-1; else {{sk=k; sd=-1;}}
   document.querySelectorAll("th").forEach(t=>t.classList.remove("asc","desc"));
   const th=document.querySelector(`th[data-s="${{k}}"]`); if(th)th.classList.add(sd===-1?"desc":"asc");
-  const idx={{mgr:0,holdings:1,ticker:2,name:3,pct:4,mcap:5}};
+  const idx={{mgr:0,holdings:1,ticker:2,name:3,pct:4,value:5,mcap:6}};
   function val(r){{
-    if(["holdings","pct","mcap"].includes(k))return num(r,k);
+    if(["holdings","pct","mcap","value"].includes(k))return num(r,k);
     return (r.cells[idx[k]]?.textContent||"").toLowerCase();
   }}
   [...rows].sort((a,b)=>{{const x=val(a),y=val(b);return x<y?sd:x>y?-sd:0;}}).forEach(r=>tb.appendChild(r));
@@ -630,7 +655,7 @@ def main():
                     "manager": f["name"], "source": f["source"],
                     "holdings": f["holdings"], "fund_url": f["fund_url"],
                     "ticker": p["ticker"], "company": p["company"],
-                    "pct": p["pct"], "mcap": mc,
+                    "pct": p["pct"], "value": p.get("value"), "mcap": mc,
                 })
 
     n_big = sum(1 for r in rows if (r["pct"] or 0) >= BIG_POSITION)

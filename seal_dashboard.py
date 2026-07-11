@@ -90,25 +90,37 @@ TEMPLATE = r"""<!DOCTYPE html>
   </div>
 <script>
 const DATA = { salt:"__SALT__", nonce:"__NONCE__", ct:"__CT__", iter:__ITER__ };
+const KEY = "sv_pw";
 const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
-async function unlock() {
-  const pw = document.getElementById("pw").value;
+async function decryptWith(pw) {
+  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey(
+    { name:"PBKDF2", salt:b64(DATA.salt), iterations:DATA.iter, hash:"SHA-256" },
+    km, { name:"AES-GCM", length:256 }, false, ["decrypt"]);
+  const pt = await crypto.subtle.decrypt({ name:"AES-GCM", iv:b64(DATA.nonce) }, key, b64(DATA.ct));
+  return new TextDecoder().decode(pt);
+}
+async function unlock(pw, fromStore) {
   const err = document.getElementById("err");
-  err.textContent = "";
+  if (err) err.textContent = "";
+  pw = (pw != null) ? pw : document.getElementById("pw").value;
   try {
-    const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
-    const key = await crypto.subtle.deriveKey(
-      { name:"PBKDF2", salt:b64(DATA.salt), iterations:DATA.iter, hash:"SHA-256" },
-      km, { name:"AES-GCM", length:256 }, false, ["decrypt"]);
-    const pt = await crypto.subtle.decrypt({ name:"AES-GCM", iv:b64(DATA.nonce) }, key, b64(DATA.ct));
-    const html = new TextDecoder().decode(pt);
+    const html = await decryptWith(pw);
+    try { sessionStorage.setItem(KEY, pw); } catch (e) {}   // per-tab; cleared on tab close
     document.open(); document.write(html); document.close();
   } catch (e) {
-    err.textContent = "Wrong password.";
+    if (fromStore) { try { sessionStorage.removeItem(KEY); } catch (_) {} }
+    else if (err) err.textContent = "Wrong password.";
   }
 }
-document.getElementById("go").addEventListener("click", unlock);
-document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") unlock(); });
+function boot() {
+  document.getElementById("go").addEventListener("click", () => unlock());
+  document.getElementById("pw").addEventListener("keydown", e => { if (e.key === "Enter") unlock(); });
+  let saved = null; try { saved = sessionStorage.getItem(KEY); } catch (e) {}
+  if (saved) unlock(saved, true);   // auto-unlock after a Refresh reload
+}
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+else boot();   // script is at end of <body>; DOMContentLoaded may have already fired
 </script>
 </body></html>"""
 
