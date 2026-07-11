@@ -1,0 +1,50 @@
+name: Daily refresh
+
+# Re-scrape Dataroma + Yahoo, re-encrypt the dashboard, and redeploy once a day.
+on:
+  schedule:
+    - cron: "0 11 * * *"   # 11:00 UTC daily (~6-7am US Eastern)
+  workflow_dispatch: {}      # allow manual "Run workflow" from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --quiet curl_cffi beautifulsoup4 cryptography
+
+      - name: Scrape + rebuild dashboard
+        env:
+          CI: "true"
+        run: python concentrated_tracker.py
+
+      - name: Encrypt into index.html
+        env:
+          SEAL_PW: ${{ secrets.SEAL_PW }}
+        run: python seal_dashboard.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain index.html | grep -q .; then
+            git add index.html
+            git commit -m "Daily refresh: $(date -u +'%Y-%m-%d')"
+            git push
+            echo "Pushed refreshed dashboard."
+          else
+            echo "No change in data today."
+          fi
