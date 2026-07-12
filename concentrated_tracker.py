@@ -530,6 +530,7 @@ def generate_html(rows, mgr_meta, elapsed):
           <td class="ctr links">
             <a href="{r['fund_url']}" target="_blank" title="{src_title}">{src_short}</a>
           </td>
+          <td class="ctr"><input type="checkbox" class="hidechk" title="Hide this row"></td>
         </tr>"""
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -577,6 +578,9 @@ def generate_html(rows, mgr_meta, elapsed):
   .btn-reset {{ background:var(--bg3); border:1px solid var(--border); color:var(--muted);
     padding:6px 14px; border-radius:6px; cursor:pointer; font-size:12px; }}
   .btn-reset:hover {{ border-color:var(--blue); color:var(--blue); }}
+  .btn-reset.active {{ border-color:var(--blue); color:var(--blue); background:var(--bg2); }}
+  .hidechk {{ cursor:pointer; width:15px; height:15px; }}
+  tbody tr.hidden-row {{ opacity:.4; }}
   .wrap {{ padding:20px 32px; overflow-x:auto; }}
   table {{ width:100%; border-collapse:collapse; white-space:nowrap; }}
   thead tr {{ background:var(--bg3); }}
@@ -651,6 +655,8 @@ def generate_html(rows, mgr_meta, elapsed):
     <option value="5000000">≥ $5M</option><option value="10000000">≥ $10M</option>
     <option value="25000000">≥ $25M</option><option value="50000000">≥ $50M</option>
     <option value="100000000">≥ $100M</option></select></div>
+  <button class="btn-reset" id="f-show" onclick="setHidden(true)" title="Reveal hidden rows (greyed) so you can un-check them">Show hidden (0)</button>
+  <button class="btn-reset active" id="f-hide" onclick="setHidden(false)" title="Collapse hidden rows out of view">Hide hidden</button>
   <button class="btn-reset" onclick="reset()">Reset</button>
 </div>
 
@@ -667,6 +673,7 @@ def generate_html(rows, mgr_meta, elapsed):
       <th class="ctr" data-s="cur" title="Current price from Yahoo Finance — refreshed daily">Current</th>
       <th class="ctr" data-s="mcap">Market Cap</th>
       <th class="ctr">Links</th>
+      <th class="ctr" title="Check to hide a row from the view &amp; export. Kept in your browser — the data is not lost, and 'Show hidden' brings it back.">Hide</th>
     </tr></thead>
     <tbody id="tb">{body}</tbody>
   </table>
@@ -687,6 +694,24 @@ const tb=document.getElementById("tb"), rows=[...tb.querySelectorAll("tr")];
 let sk="", sdesc=true;
 const NUMCOL=["holdings","pct","value","buy","cur","mcap"];
 function num(r,a){{const n=parseFloat(r.dataset[a]);return isNaN(n)?-9999:n;}}
+
+// --- Hide state (persisted in the browser; survives reloads & daily refreshes) ---
+const HKEY="hidden_v1";
+let hiddenSet=new Set(); try {{ hiddenSet=new Set(JSON.parse(localStorage.getItem(HKEY)||"[]")); }} catch(e) {{}}
+let showHidden=false;
+function rowId(r){{ return r.dataset.mgr+"|"+r.dataset.ticker; }}
+function saveHidden(){{ try {{ localStorage.setItem(HKEY,JSON.stringify([...hiddenSet])); }} catch(e) {{}} }}
+function updateHiddenLabel(){{
+  const b=document.getElementById("f-show");
+  if(b) b.textContent="Show hidden ("+hiddenSet.size+")";
+}}
+function setHidden(v){{
+  showHidden=v;
+  document.getElementById("f-show").classList.toggle("active",v);
+  document.getElementById("f-hide").classList.toggle("active",!v);
+  updateHiddenLabel(); apply();
+}}
+
 function apply(){{
   const q=document.getElementById("f-q").value.toLowerCase();
   const mh=parseFloat(document.getElementById("f-h").value);
@@ -695,9 +720,12 @@ function apply(){{
   const mi=parseFloat(document.getElementById("f-inv").value);
   let n=0;
   rows.forEach(r=>{{
+    const isHidden=hiddenSet.has(rowId(r));
     const ok=(!q||r.dataset.mgr.includes(q)||r.dataset.ticker.includes(q))
       && num(r,"holdings")<=mh && num(r,"mcap")<=mc*1e6 && num(r,"pct")>=mp
-      && (mi<=0 || num(r,"value")>=mi);
+      && (mi<=0 || num(r,"value")>=mi)
+      && (!isHidden || showHidden);
+    r.classList.toggle("hidden-row", isHidden && ok);
     r.style.display=ok?"":"none"; if(ok)n++;
   }});
   document.getElementById("s-showing").textContent=n;
@@ -734,7 +762,7 @@ function copyForSheets(btn){{
   const lines=[cols.join("\\t")];
   const nn=v=>{{const n=parseFloat(v);return (isNaN(n)||n<0)?"":n;}};
   rows.forEach(r=>{{
-    if(r.style.display==="none")return;
+    if(r.style.display==="none"||hiddenSet.has(rowId(r)))return;
     const mgr=(r.cells[0].textContent||"").replace(/\\s+(DR|VS)\\s*$/,"").trim();
     const tk=r.cells[2].textContent.trim();
     const co=r.cells[3].textContent.trim();
@@ -756,6 +784,17 @@ function fallback(text,done){{
   ta.select();try{{document.execCommand("copy");done();}}catch(e){{}}
   document.body.removeChild(ta);
 }}
+
+// wire the per-row Hide checkboxes to the persisted hidden set
+rows.forEach(r=>{{
+  const cb=r.querySelector(".hidechk"); if(!cb) return;
+  cb.checked=hiddenSet.has(rowId(r));
+  cb.addEventListener("change",()=>{{
+    if(cb.checked) hiddenSet.add(rowId(r)); else hiddenSet.delete(rowId(r));
+    saveHidden(); updateHiddenLabel(); apply();
+  }});
+}});
+updateHiddenLabel();
 apply();
 </script>
 </body></html>"""
