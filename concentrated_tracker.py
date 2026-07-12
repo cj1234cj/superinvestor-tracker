@@ -253,8 +253,62 @@ def valuesider_slugs():
         return []
 
 
+# SEC EDGAR — the 13F filing gives exact value + shares -> reported (buy) price
+_sec = crequests.Session(impersonate="chrome136", verify=VERIFY_SSL)
+_SEC_UA = {"User-Agent": "concentrated-tracker research njerseycraig@gmail.com"}
+_NAME_STOP = {"inc", "corp", "corporation", "co", "company", "companies", "ltd",
+              "limited", "lp", "llc", "plc", "sa", "ag", "nv", "the", "group",
+              "holdings", "holding", "cl", "class", "a", "b", "c", "adr", "and",
+              "&", "com", "new", "de", "reit", "spa", "hldgs", "int", "intl"}
+
+
+def _name_key(s):
+    toks = [t for t in re.split(r"[^a-z0-9]+", s.lower()) if t and t not in _NAME_STOP]
+    return toks
+
+
+def fetch_13f_reported(index_url):
+    """From a SEC 13F filing index URL, return {name_key: {value, shares, price}}."""
+    try:
+        r = _sec.get(index_url, headers=_SEC_UA, timeout=20)
+        xmls = re.findall(r'href="([^"]+\.xml)"', r.text)
+        info = [x for x in xmls if "xslform13f" not in x.lower() and "primary_doc" not in x.lower()]
+        if not info:
+            return {}
+        url = "https://www.sec.gov" + info[0] if info[0].startswith("/") else info[0]
+        xml = _sec.get(url, headers=_SEC_UA, timeout=20).text
+        out = {}
+        for b in re.findall(r"<(?:\w+:)?infoTable>(.*?)</(?:\w+:)?infoTable>", xml, re.S):
+            def g(tag):
+                m = re.search(r"<(?:\w+:)?" + tag + r">(.*?)</(?:\w+:)?" + tag + ">", b, re.S)
+                return m.group(1).strip() if m else ""
+            name = g("nameOfIssuer")
+            value = float(re.sub(r"[^0-9.]", "", g("value")) or 0)
+            shares = float(re.sub(r"[^0-9.]", "", g("sshPrnamt")) or 0)
+            if not name or shares <= 0 or value <= 0:
+                continue
+            price = value / shares
+            # 13F value is in whole $ (post-2023); guard against legacy $-thousands
+            if price < 0.5:
+                value *= 1000
+                price *= 1000
+            toks = _name_key(name)
+            if not toks:
+                continue
+            rec = {"value": value, "shares": shares, "price": price}
+            # aggregate share classes under the same issuer (keep largest position)
+            for key in (" ".join(toks[:2]), toks[0]):
+                if key not in out or value > out[key]["value"]:
+                    out[key] = rec
+        return out
+    except Exception as e:
+        print(f"    ! SEC 13F {index_url}: {e}")
+        return {}
+
+
 def scrape_valuesider_fund(slug):
-    """Parse one Valuesider guru page -> {name, count, positions[top]} or None."""
+    """Parse one Valuesider guru page -> {name, count, positions[top]} or None.
+    Enriches each position with the SEC 13F reported price + exact value."""
     try:
         html = _vs.get(f"{VS_BASE}/guru/{slug}/portfolio", timeout=20).text
         soup = BeautifulSoup(html, "html.parser")
@@ -270,16 +324,28 @@ def scrape_valuesider_fund(slug):
         # total portfolio value -> used to derive each position's $ size
         vm = re.search(r"portfolio value of \$([0-9,]+)", txt)
         port_value = float(vm.group(1).replace(",", "")) if vm else None
+        # SEC 13F filing link -> exact value + reported (buy) price per holding
+        sm = re.search(r"(/Archives/edgar/data/\d+/[\d-]+-index\.html)", html)
+        reported = fetch_13f_reported("https://www.sec.gov" + sm.group(1)) if sm else {}
         # top holdings summary: "(TICKER)</a> COMPANY NAME (NN.NN%)" in the HTML
         positions = []
         for tk, mid_txt, pct in re.findall(r"\(([A-Z0-9.\-]{1,6})\)([^(]*?)\(([0-9.]+)%\)", html):
             company = re.sub(r"<[^>]+>", "", mid_txt).strip(" ,-–").title()
             pctf = float(pct)
+            # match this holding to its 13F record by company name
+            keys = _name_key(company)
+            rec = None
+            for key in ([" ".join(keys[:2]), keys[0]] if keys else []):
+                if key in reported:
+                    rec = reported[key]
+                    break
             positions.append({
                 "ticker": tk.upper().strip(),
                 "company": company,
                 "pct": pctf,
-                "value": (port_value * pctf / 100.0) if port_value else None,
+                "value": rec["value"] if rec else ((port_value * pctf / 100.0) if port_value else None),
+                "value_exact": rec is not None,
+                "buy_price": rec["price"] if rec else None,
             })
         # de-dupe tickers, keep highest pct
         best = {}
@@ -372,7 +438,7 @@ def generate_html(rows, mgr_meta, elapsed):
             val_val = round(val)
         else:
             val_str, val_val = "—", -1
-        val_est = ' <span class="est" title="Estimated from portfolio value × weight">~</span>' if (val and r.get("source") == "Valuesider") else ""
+        val_est = ' <span class="est" title="Estimated from portfolio value × weight">~</span>' if (val and not r.get("value_exact", True)) else ""
         bp = r.get("buy_price")
         cp = r.get("cur_price")
         bp_str = f"${bp:,.2f}" if bp else "—"
@@ -548,7 +614,7 @@ def generate_html(rows, mgr_meta, elapsed):
   <span class="src dr">DR</span> = Dataroma (full holdings) ·
   <span class="src vs">VS</span> = Valuesider-only fund, not on Dataroma (top holdings shown — a ≥{BIG_POSITION:.0f}% position is always a top holding) ·
   <b>$ Position</b> = value at latest 13F (<span class="est">~</span> = estimated for VS funds) ·
-  <b>Buy Price</b> = reported price at the 13F filing (Dataroma funds; blank for VS-only) ·
+  <b>Buy Price</b> = reported price at the 13F filing (Dataroma; SEC EDGAR 13F for Valuesider funds) ·
   <b>Current</b> &amp; Market Cap = Yahoo Finance, refreshed daily ·
   Generated {now} · Informational only — not investment advice.
 </div>
@@ -720,6 +786,7 @@ def main():
                     "holdings": f["holdings"], "fund_url": f["fund_url"],
                     "ticker": p["ticker"], "company": p["company"],
                     "pct": p["pct"], "value": p.get("value"),
+                    "value_exact": p.get("value_exact", True),
                     "buy_price": p.get("buy_price"), "cur_price": q.get("price"),
                     "mcap": q["mcap"],
                 })
