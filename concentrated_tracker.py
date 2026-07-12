@@ -440,9 +440,15 @@ def fetch_doubling(ticker):
     if not cik:
         return ("—", "—", None, None)
     try:
-        time.sleep(random.uniform(0.1, 0.3))
-        f = _sec.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json",
-                     headers=_SEC_UA, timeout=25).json()
+        time.sleep(random.uniform(0.2, 0.5))
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+        r = _sec.get(url, headers=_SEC_UA, timeout=25)
+        if r.status_code != 200:                     # throttled/transient -> retry once
+            time.sleep(random.uniform(0.8, 1.5))
+            r = _sec.get(url, headers=_SEC_UA, timeout=25)
+        if r.status_code != 200:
+            return ("—", "—", None, None)
+        f = r.json()
         g = f.get("facts", {}).get("us-gaap", {})
         rev = _annual_usd(g, _REV_CONCEPTS)
         ocf = _annual_usd(g, _OCF_CONCEPTS)
@@ -1056,7 +1062,7 @@ def main():
         with dlock:
             dbl[tk] = res
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:   # stay under SEC's 10 req/sec
         for fut in as_completed({ex.submit(work_dbl, t): t for t in row_tickers}):
             try:
                 fut.result()
