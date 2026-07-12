@@ -100,38 +100,41 @@ def _get_crumb():
         return _crumb
 
 
-def _yahoo_mcap(sym):
+def _yahoo_quote(sym):
+    """Return (market_cap, current_price) or (None, None)."""
     crumb = _get_crumb()
     url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}"
     params = {"modules": "price", "crumb": crumb}
     r = _yf.get(url, params=params, timeout=15)
-    if r.status_code == 401:
+    if r.status_code == 401 or (r.status_code == 200 and "Invalid Crumb" in r.text):
         global _crumb
         with _crumb_lock:
             _crumb = None
         params["crumb"] = _get_crumb()
         r = _yf.get(url, params=params, timeout=15)
     if r.status_code != 200:
-        return None
+        return None, None
     res = r.json().get("quoteSummary", {}).get("result")
     if not res:
-        return None
-    return ((res[0].get("price", {}).get("marketCap")) or {}).get("raw")
+        return None, None
+    p = res[0].get("price", {})
+    return ((p.get("marketCap") or {}).get("raw"),
+            (p.get("regularMarketPrice") or {}).get("raw"))
 
 
-def fetch_market_cap(ticker):
-    """Return market cap (float) or None. Retries with a Yahoo-normalized
+def fetch_quote(ticker):
+    """Return (market_cap, current_price). Retries with a Yahoo-normalized
     symbol (dot->dash, drop -OLD) so dot-class small caps aren't dropped."""
     try:
         time.sleep(random.uniform(0.15, 0.4))
-        mc = _yahoo_mcap(ticker)
+        mc, price = _yahoo_quote(ticker)
         if not mc:
             alt = ticker.replace(".", "-").replace("-OLD", "")
             if alt != ticker:
-                mc = _yahoo_mcap(alt)
-        return mc
+                mc, price = _yahoo_quote(alt)
+        return mc, price
     except Exception:
-        return None
+        return None, None
 
 
 # ── Dataroma scraping ─────────────────────────────────────────────────
@@ -172,6 +175,7 @@ def scrape_manager(mgr_id, mgr_name):
         cols = [c.get_text(strip=True).lower() for c in header.find_all(["th", "td"])]
         pct_i = next((i for i, c in enumerate(cols) if "portfolio" in c), 2)
         val_i = next((i for i, c in enumerate(cols) if c == "value" or c.startswith("value")), None)
+        price_i = next((i for i, c in enumerate(cols) if "reported" in c and "price" in c), None)
         positions = []
         for row in table.find_all("tr")[1:]:
             tds = row.find_all("td")
@@ -193,9 +197,14 @@ def scrape_manager(mgr_id, mgr_name):
             value = None
             if val_i is not None and val_i < len(tds):
                 v = re.sub(r"[^0-9]", "", tds[val_i].get_text(strip=True))
-                value = float(v) if v else None    # Dataroma "Value" is in $ (thousands? no — full $)
+                value = float(v) if v else None    # Dataroma "Value" is in full $
+            buy_price = None
+            if price_i is not None and price_i < len(tds):
+                p = re.sub(r"[^0-9.]", "", tds[price_i].get_text(strip=True))
+                buy_price = float(p) if p else None    # reported price at the 13F filing
             if sym and 1 < len(sym) <= 7:
-                positions.append({"ticker": sym, "company": company, "pct": pct, "value": value})
+                positions.append({"ticker": sym, "company": company, "pct": pct,
+                                  "value": value, "buy_price": buy_price})
         return positions
     except Exception as e:
         print(f"    ! {mgr_name}: {e}")
@@ -364,6 +373,17 @@ def generate_html(rows, mgr_meta, elapsed):
         else:
             val_str, val_val = "—", -1
         val_est = ' <span class="est" title="Estimated from portfolio value × weight">~</span>' if (val and r.get("source") == "Valuesider") else ""
+        bp = r.get("buy_price")
+        cp = r.get("cur_price")
+        bp_str = f"${bp:,.2f}" if bp else "—"
+        cp_str = f"${cp:,.2f}" if cp else "—"
+        bp_val = bp if bp else -1
+        cp_val = cp if cp else -1
+        gain_cls, gain_tip = "", ""
+        if bp and cp:
+            chg = (cp / bp - 1) * 100
+            gain_cls = " up" if cp >= bp else " down"
+            gain_tip = f' title="{chg:+.0f}% vs reported buy price"'
         star = '<span class="star" title="Big slice of the fund (≥10%)">★</span> ' if big else ""
         row_cls = ' class="big"' if big else ""
         src = r.get("source", "Dataroma")
@@ -373,13 +393,15 @@ def generate_html(rows, mgr_meta, elapsed):
         body += f"""
         <tr{row_cls} data-mgr="{r['manager'].lower()}" data-ticker="{r['ticker'].lower()}"
             data-holdings="{r['holdings']}" data-pct="{pct_val:.2f}" data-mcap="{mc_val}"
-            data-source="{src}" data-value="{val_val}" data-big="{1 if big else 0}">
+            data-source="{src}" data-value="{val_val}" data-buy="{bp_val}" data-cur="{cp_val}" data-big="{1 if big else 0}">
           <td class="mgr">{r['manager']} <span class="src {src_short.lower()}" title="{src_title}">{src_short}</span></td>
           <td class="ctr"><span class="badge">{r['holdings']}</span></td>
           <td><a class="tk" href="https://finance.yahoo.com/quote/{r['ticker']}" target="_blank">{r['ticker']}</a></td>
           <td class="name" title="{r['company']}">{r['company']}</td>
           <td class="ctr pct">{star}{pct_str}</td>
           <td class="ctr">{val_str}{val_est}</td>
+          <td class="ctr">{bp_str}</td>
+          <td class="ctr{gain_cls}"{gain_tip}>{cp_str}</td>
           <td class="ctr">{mc_str}</td>
           <td class="ctr links">
             <a href="{r['fund_url']}" target="_blank" title="{src_title}">{src_short}</a>
@@ -404,9 +426,13 @@ def generate_html(rows, mgr_meta, elapsed):
   body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
     background:var(--bg); color:var(--text); font-size:13px; }}
   .header {{ background:var(--bg2); border-bottom:1px solid var(--border); padding:26px 32px 18px; position:relative; }}
-  .refresh {{ position:absolute; top:26px; right:32px; background:var(--blue); color:#fff; border:0;
-    border-radius:8px; padding:9px 16px; font-size:13px; font-weight:600; cursor:pointer; }}
-  .refresh:hover {{ background:#0860ca; }}
+  .actions {{ position:absolute; top:24px; right:32px; display:flex; gap:8px; }}
+  .btn2 {{ background:var(--blue); color:#fff; border:0; border-radius:8px; padding:9px 14px;
+    font-size:13px; font-weight:600; cursor:pointer; white-space:nowrap; }}
+  .btn2:hover {{ background:#0860ca; }}
+  .btn2.ghost {{ background:var(--bg3); color:var(--text); border:1px solid var(--border); }}
+  .btn2.ghost:hover {{ border-color:var(--blue); color:var(--blue); }}
+  .btn2.ok {{ background:var(--green); }}
   .header h1 {{ font-size:22px; font-weight:700; color:var(--blue); margin-bottom:6px; }}
   .header p {{ color:var(--muted); }}
   .tag {{ display:inline-block; background:rgba(63,185,80,.12); color:var(--green);
@@ -456,6 +482,8 @@ def generate_html(rows, mgr_meta, elapsed):
     padding:1px 9px; border-radius:10px; font-size:11px; font-weight:700; }}
   .star {{ color:var(--gold); }}
   .est {{ color:var(--muted); font-size:11px; }}
+  .up {{ color:var(--green); font-weight:600; }}
+  .down {{ color:var(--red); font-weight:600; }}
   .links a {{ color:var(--muted); text-decoration:none; font-weight:700; font-size:11px;
     border:1px solid var(--border); border-radius:5px; padding:2px 6px; margin:0 2px; }}
   .links a:hover {{ color:var(--blue); border-color:var(--blue); }}
@@ -464,7 +492,10 @@ def generate_html(rows, mgr_meta, elapsed):
 </style></head><body>
 
 <div class="header">
-  <button class="refresh" onclick="location.reload()" title="Reload to pull the latest data (auto-refreshed daily)">⟳ Refresh</button>
+  <div class="actions">
+    <button class="btn2" onclick="copyForSheets(this)" title="Copy the visible rows as tab-separated text — paste straight into Google Sheets">⧉ Copy for Sheets</button>
+    <button class="btn2 ghost" onclick="location.reload()" title="Reload to pull the latest data (auto-refreshed daily)">⟳ Refresh</button>
+  </div>
   <h1>Concentrated Superinvestor — Small-Cap Tracker</h1>
   <p>Positions held by focused fund managers, filtered to small caps:
     <span class="tag">Manager holds ≤ {MAX_HOLDINGS} stocks</span>
@@ -503,6 +534,8 @@ def generate_html(rows, mgr_meta, elapsed):
       <th data-s="name">Company</th>
       <th class="ctr" data-s="pct">% of Fund</th>
       <th class="ctr" data-s="value" title="Dollar size of the position at the latest 13F filing">$ Position</th>
+      <th class="ctr" data-s="buy" title="Reported price at the manager's 13F filing (Dataroma funds)">Buy Price</th>
+      <th class="ctr" data-s="cur" title="Current price from Yahoo Finance — refreshed daily">Current</th>
       <th class="ctr" data-s="mcap">Market Cap</th>
       <th class="ctr">Links</th>
     </tr></thead>
@@ -514,14 +547,16 @@ def generate_html(rows, mgr_meta, elapsed):
 <div class="footer">
   <span class="src dr">DR</span> = Dataroma (full holdings) ·
   <span class="src vs">VS</span> = Valuesider-only fund, not on Dataroma (top holdings shown — a ≥{BIG_POSITION:.0f}% position is always a top holding) ·
-  <b>$ Position</b> = value at latest 13F (<span class="est">~</span> = estimated from portfolio value × weight for VS funds) ·
-  Market caps from Yahoo Finance · Generated {now} · Informational only — not investment advice.
+  <b>$ Position</b> = value at latest 13F (<span class="est">~</span> = estimated for VS funds) ·
+  <b>Buy Price</b> = reported price at the 13F filing (Dataroma funds; blank for VS-only) ·
+  <b>Current</b> &amp; Market Cap = Yahoo Finance, refreshed daily ·
+  Generated {now} · Informational only — not investment advice.
 </div>
 
 <script>
 const tb=document.getElementById("tb"), rows=[...tb.querySelectorAll("tr")];
 let sk="pct", sd=-1;
-function num(r,a){{return parseFloat(r.dataset[a]??"-9999")||-9999;}}
+function num(r,a){{const n=parseFloat(r.dataset[a]);return isNaN(n)?-9999:n;}}
 function apply(){{
   const q=document.getElementById("f-q").value.toLowerCase();
   const mh=parseFloat(document.getElementById("f-h").value);
@@ -540,9 +575,9 @@ function sort(k){{
   if(sk===k)sd*=-1; else {{sk=k; sd=-1;}}
   document.querySelectorAll("th").forEach(t=>t.classList.remove("asc","desc"));
   const th=document.querySelector(`th[data-s="${{k}}"]`); if(th)th.classList.add(sd===-1?"desc":"asc");
-  const idx={{mgr:0,holdings:1,ticker:2,name:3,pct:4,value:5,mcap:6}};
+  const idx={{mgr:0,holdings:1,ticker:2,name:3,pct:4,value:5,buy:6,cur:7,mcap:8}};
   function val(r){{
-    if(["holdings","pct","mcap","value"].includes(k))return num(r,k);
+    if(["holdings","pct","mcap","value","buy","cur"].includes(k))return num(r,k);
     return (r.cells[idx[k]]?.textContent||"").toLowerCase();
   }}
   [...rows].sort((a,b)=>{{const x=val(a),y=val(b);return x<y?sd:x>y?-sd:0;}}).forEach(r=>tb.appendChild(r));
@@ -557,6 +592,35 @@ function reset(){{
 document.querySelectorAll("th[data-s]").forEach(t=>t.addEventListener("click",()=>sort(t.dataset.s)));
 ["f-q","f-h","f-mc","f-p"].forEach(id=>document.getElementById(id)
   .addEventListener(id==="f-q"?"input":"change",apply));
+
+function copyForSheets(btn){{
+  const cols=["Manager","Source","# Holdings","Ticker","Company","% of Fund",
+    "$ Position","Buy Price","Current Price","Market Cap"];
+  const lines=[cols.join("\\t")];
+  const nn=v=>{{const n=parseFloat(v);return (isNaN(n)||n<0)?"":n;}};
+  rows.forEach(r=>{{
+    if(r.style.display==="none")return;
+    const mgr=(r.cells[0].textContent||"").replace(/\\s+(DR|VS)\\s*$/,"").trim();
+    const tk=r.cells[2].textContent.trim();
+    const co=r.cells[3].textContent.trim();
+    const mcap=nn(r.dataset.mcap); // in $M
+    lines.push([mgr, r.dataset.source, r.dataset.holdings, tk, co,
+      nn(r.dataset.pct), nn(r.dataset.value), nn(r.dataset.buy), nn(r.dataset.cur),
+      mcap===""?"":Math.round(mcap*1e6)].join("\\t"));
+  }});
+  const tsv=lines.join("\\n");
+  const done=()=>{{const t=btn.textContent;btn.textContent="Copied "+(lines.length-1)+" rows ✓";
+    btn.classList.add("ok");setTimeout(()=>{{btn.textContent=t;btn.classList.remove("ok");}},1800);}};
+  if(navigator.clipboard&&navigator.clipboard.writeText){{
+    navigator.clipboard.writeText(tsv).then(done).catch(()=>fallback(tsv,done));
+  }} else fallback(tsv,done);
+}}
+function fallback(text,done){{
+  const ta=document.createElement("textarea");ta.value=text;
+  ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);
+  ta.select();try{{document.execCommand("copy");done();}}catch(e){{}}
+  document.body.removeChild(ta);
+}}
 apply();
 </script>
 </body></html>"""
@@ -624,18 +688,18 @@ def main():
     print(f"\n  {len(funds)} concentrated funds (<= {MAX_HOLDINGS} holdings): {n_dr} Dataroma + {n_vs} Valuesider-only.")
 
     tickers = sorted({p["ticker"] for f in funds for p in f["positions"]})
-    print(f"\n[2/3] Fetching market caps for {len(tickers)} unique tickers (Yahoo)...")
-    mcaps = {}
+    print(f"\n[2/3] Fetching market cap + current price for {len(tickers)} tickers (Yahoo, live)...")
+    quotes = {}
     done = [0]
     lock = threading.Lock()
 
     def work(tk):
-        mc = fetch_market_cap(tk)
+        mc, price = fetch_quote(tk)
         with lock:
             done[0] += 1
             print(f"  {done[0]}/{len(tickers)}  {tk:<8}", end="\r", flush=True)
             if mc:
-                mcaps[tk] = mc
+                quotes[tk] = {"mcap": mc, "price": price}
 
     with ThreadPoolExecutor(max_workers=3) as ex:
         for f in as_completed({ex.submit(work, t): t for t in tickers}):
@@ -649,13 +713,15 @@ def main():
     rows = []
     for f in funds:
         for p in f["positions"]:
-            mc = mcaps.get(p["ticker"])
-            if mc and mc < MCAP_CEILING:
+            q = quotes.get(p["ticker"])
+            if q and q["mcap"] < MCAP_CEILING:
                 rows.append({
                     "manager": f["name"], "source": f["source"],
                     "holdings": f["holdings"], "fund_url": f["fund_url"],
                     "ticker": p["ticker"], "company": p["company"],
-                    "pct": p["pct"], "value": p.get("value"), "mcap": mc,
+                    "pct": p["pct"], "value": p.get("value"),
+                    "buy_price": p.get("buy_price"), "cur_price": q.get("price"),
+                    "mcap": q["mcap"],
                 })
 
     n_big = sum(1 for r in rows if (r["pct"] or 0) >= BIG_POSITION)
