@@ -423,7 +423,8 @@ def _doubled_5yr(series):
     by = max(base_years)                            # closest point ~5 years back
     if series[by] <= 0:
         return "—"
-    return "Yes" if series[latest] >= 2 * series[by] else "No"
+    # count "within 10% of a double" as a double (>= 1.8x instead of 2.0x)
+    return "Yes" if series[latest] >= 1.8 * series[by] else "No"
 
 
 def fetch_doubling(ticker):
@@ -774,8 +775,8 @@ def generate_html(rows, mgr_meta, elapsed):
       <th class="ctr" data-s="buy" title="Reported price at the manager's 13F filing (Dataroma funds)">Buy Price</th>
       <th class="ctr" data-s="cur" title="Current price from Yahoo Finance — refreshed daily">Current</th>
       <th class="ctr" data-s="mcap">Market Cap</th>
-      <th class="ctr" data-s="rev" title="Yes if revenue at least DOUBLED over the last ~5 years (SEC filings)">Rev 2×/5y</th>
-      <th class="ctr" data-s="ocf" title="Yes if operating cash flow at least DOUBLED over the last ~5 years (SEC filings)">OCF 2×/5y</th>
+      <th class="ctr" data-s="rev" title="Yes if revenue at least doubled over the last ~5 years — within 10% of a double (≥1.8×) counts (SEC filings)">Rev 2×/5y</th>
+      <th class="ctr" data-s="ocf" title="Yes if operating cash flow at least doubled over the last ~5 years — within 10% of a double (≥1.8×) counts (SEC filings)">OCF 2×/5y</th>
       <th class="ctr">Links</th>
       <th class="ctr" title="Check to hide a row from the view &amp; export. Kept in your browser — the data is not lost, and 'Show hidden' brings it back.">Hide</th>
     </tr></thead>
@@ -790,7 +791,7 @@ def generate_html(rows, mgr_meta, elapsed):
   <b>$ Position</b> = value at latest 13F (<span class="est">~</span> = estimated for VS funds) ·
   <b>Buy Price</b> = reported price at the 13F filing (Dataroma; SEC EDGAR 13F for Valuesider funds) ·
   <b>Current</b> &amp; Market Cap = Yahoo Finance, refreshed daily ·
-  <b>Rev/OCF 2×/5y</b> = Yes if revenue / operating cash flow at least doubled over the last ~5 years (SEC filings; — = too little history) ·
+  <b>Rev/OCF 2×/5y</b> = Yes if revenue / operating cash flow at least doubled over the last ~5 years, counting within 10% (≥1.8×) as a double (SEC filings; — = too little history) ·
   Generated {now} · Informational only — not investment advice.
 </div>
 
