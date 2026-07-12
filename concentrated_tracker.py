@@ -22,7 +22,7 @@ import re
 import threading
 import webbrowser
 import pathlib
-from datetime import datetime
+from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bs4 import BeautifulSoup
@@ -357,6 +357,93 @@ def fetch_13f_reported(index_url):
         return {}
 
 
+# ── SEC company-facts: did revenue / operating cash flow double every 5 years? ──
+_REV_CONCEPTS = [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "SalesRevenueNet",
+    "RevenuesNetOfInterestExpense",
+]
+_OCF_CONCEPTS = [
+    "NetCashProvidedByUsedInOperatingActivities",
+    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+]
+_cik_map = None
+_cik_lock = threading.Lock()
+
+
+def _ticker_cik_map():
+    global _cik_map
+    with _cik_lock:
+        if _cik_map is not None:
+            return _cik_map
+        try:
+            j = _sec.get("https://www.sec.gov/files/company_tickers.json",
+                         headers=_SEC_UA, timeout=25).json()
+            _cik_map = {v["ticker"].upper(): v["cik_str"] for v in j.values()}
+        except Exception:
+            _cik_map = {}
+        return _cik_map
+
+
+def _annual_usd(gaap, concepts):
+    """Merge concepts (companies switch XBRL tags over the years) -> {fiscal_year: value}."""
+    out = {}
+    for c in concepts:
+        node = gaap.get(c)
+        if not node:
+            continue
+        for u in node.get("units", {}).get("USD", []):
+            s, e, v = u.get("start"), u.get("end"), u.get("val")
+            if not s or not e or v is None:
+                continue
+            try:
+                days = (date.fromisoformat(e) - date.fromisoformat(s)).days
+            except Exception:
+                continue
+            if days < 350 or days > 380:          # annual periods only
+                continue
+            if u.get("form") not in ("10-K", "10-K/A", "20-F", "20-F/A"):
+                continue
+            out.setdefault(int(e[:4]), v)          # higher-priority concept wins per year
+    return out
+
+
+def _doubled_5yr(series):
+    """'Yes' if the latest annual value is >= 2x its value ~5 years earlier
+    (at least one doubling in the last 5 years). '—' if history is too short."""
+    ys = sorted(series)
+    if len(ys) < 2:
+        return "—"
+    latest = ys[-1]
+    base_years = [y for y in ys if y <= latest - 5] or [y for y in ys if y <= latest - 4]
+    if not base_years:
+        return "—"
+    by = max(base_years)                            # closest point ~5 years back
+    if series[by] <= 0:
+        return "—"
+    return "Yes" if series[latest] >= 2 * series[by] else "No"
+
+
+def fetch_doubling(ticker):
+    """Return (revenue_doubled, ocf_doubled) as 'Yes'/'No'/'—' from SEC company-facts."""
+    cmap = _ticker_cik_map()
+    cik = cmap.get(ticker.upper()) or cmap.get(ticker.replace(".", "-").upper()) \
+        or cmap.get(ticker.split(".")[0].upper())
+    if not cik:
+        return ("—", "—")
+    try:
+        time.sleep(random.uniform(0.1, 0.3))
+        f = _sec.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json",
+                     headers=_SEC_UA, timeout=25).json()
+        g = f.get("facts", {}).get("us-gaap", {})
+        return (_doubled_5yr(_annual_usd(g, _REV_CONCEPTS)),
+                _doubled_5yr(_annual_usd(g, _OCF_CONCEPTS)))
+    except Exception:
+        return ("—", "—")
+
+
 def scrape_valuesider_fund(slug):
     """Parse one Valuesider guru page -> {name, count, positions[top]} or None.
     Enriches each position with the SEC 13F reported price + exact value."""
@@ -514,10 +601,14 @@ def generate_html(rows, mgr_meta, elapsed):
         src_short = "VS" if src == "Valuesider" else "DR"
         src_title = ("Valuesider-tracked fund (not on Dataroma) — top holdings shown"
                      if src == "Valuesider" else "View this fund on Dataroma")
+        rv = r.get("rev2x", "—")
+        oc = r.get("ocf2x", "—")
+        yn = lambda v: f'<span class="yn {("yes" if v=="Yes" else "no" if v=="No" else "na")}">{v}</span>'
         body += f"""
         <tr{row_cls} data-mgr="{r['manager'].lower()}" data-ticker="{r['ticker'].lower()}"
             data-holdings="{r['holdings']}" data-pct="{pct_val:.2f}" data-mcap="{mc_val}"
-            data-source="{src}" data-value="{val_val}" data-buy="{bp_val}" data-cur="{cp_val}" data-big="{1 if big else 0}">
+            data-source="{src}" data-value="{val_val}" data-buy="{bp_val}" data-cur="{cp_val}"
+            data-rev="{rv}" data-ocf="{oc}" data-big="{1 if big else 0}">
           <td class="mgr">{r['manager']} <span class="src {src_short.lower()}" title="{src_title}">{src_short}</span></td>
           <td class="ctr"><span class="badge">{r['holdings']}</span></td>
           <td><a class="tk" href="https://finance.yahoo.com/quote/{r['ticker']}" target="_blank">{r['ticker']}</a></td>
@@ -527,6 +618,8 @@ def generate_html(rows, mgr_meta, elapsed):
           <td class="ctr">{bp_str}</td>
           <td class="ctr{gain_cls}"{gain_tip}>{cp_str}</td>
           <td class="ctr">{mc_str}</td>
+          <td class="ctr">{yn(rv)}</td>
+          <td class="ctr">{yn(oc)}</td>
           <td class="ctr links">
             <a href="{r['fund_url']}" target="_blank" title="{src_title}">{src_short}</a>
           </td>
@@ -612,6 +705,10 @@ def generate_html(rows, mgr_meta, elapsed):
   .est {{ color:var(--muted); font-size:11px; }}
   .up {{ color:var(--green); font-weight:600; }}
   .down {{ color:var(--red); font-weight:600; }}
+  .yn {{ font-size:11px; font-weight:700; padding:1px 8px; border-radius:10px; }}
+  .yn.yes {{ background:rgba(63,185,80,.14); color:var(--green); }}
+  .yn.no {{ background:rgba(207,34,46,.10); color:var(--red); }}
+  .yn.na {{ background:var(--bg3); color:var(--muted); }}
   .links a {{ color:var(--muted); text-decoration:none; font-weight:700; font-size:11px;
     border:1px solid var(--border); border-radius:5px; padding:2px 6px; margin:0 2px; }}
   .links a:hover {{ color:var(--blue); border-color:var(--blue); }}
@@ -655,6 +752,11 @@ def generate_html(rows, mgr_meta, elapsed):
     <option value="5000000">≥ $5M</option><option value="10000000">≥ $10M</option>
     <option value="25000000">≥ $25M</option><option value="50000000">≥ $50M</option>
     <option value="100000000">≥ $100M</option></select></div>
+  <div class="fg"><label>Compounders</label><select id="f-comp">
+    <option value="">Any</option>
+    <option value="both">Rev &amp; OCF 2× (both Yes)</option>
+    <option value="rev">Revenue 2× (Yes)</option>
+    <option value="ocf">OCF 2× (Yes)</option></select></div>
   <button class="btn-reset" id="f-show" onclick="setHidden(true)" title="Reveal hidden rows (greyed) so you can un-check them">Show hidden (0)</button>
   <button class="btn-reset active" id="f-hide" onclick="setHidden(false)" title="Collapse hidden rows out of view">Hide hidden</button>
   <button class="btn-reset" onclick="reset()">Reset</button>
@@ -672,6 +774,8 @@ def generate_html(rows, mgr_meta, elapsed):
       <th class="ctr" data-s="buy" title="Reported price at the manager's 13F filing (Dataroma funds)">Buy Price</th>
       <th class="ctr" data-s="cur" title="Current price from Yahoo Finance — refreshed daily">Current</th>
       <th class="ctr" data-s="mcap">Market Cap</th>
+      <th class="ctr" data-s="rev" title="Yes if revenue at least DOUBLED over the last ~5 years (SEC filings)">Rev 2×/5y</th>
+      <th class="ctr" data-s="ocf" title="Yes if operating cash flow at least DOUBLED over the last ~5 years (SEC filings)">OCF 2×/5y</th>
       <th class="ctr">Links</th>
       <th class="ctr" title="Check to hide a row from the view &amp; export. Kept in your browser — the data is not lost, and 'Show hidden' brings it back.">Hide</th>
     </tr></thead>
@@ -686,6 +790,7 @@ def generate_html(rows, mgr_meta, elapsed):
   <b>$ Position</b> = value at latest 13F (<span class="est">~</span> = estimated for VS funds) ·
   <b>Buy Price</b> = reported price at the 13F filing (Dataroma; SEC EDGAR 13F for Valuesider funds) ·
   <b>Current</b> &amp; Market Cap = Yahoo Finance, refreshed daily ·
+  <b>Rev/OCF 2×/5y</b> = Yes if revenue / operating cash flow at least doubled over the last ~5 years (SEC filings; — = too little history) ·
   Generated {now} · Informational only — not investment advice.
 </div>
 
@@ -718,12 +823,17 @@ function apply(){{
   const mc=parseFloat(document.getElementById("f-mc").value);
   const mp=parseFloat(document.getElementById("f-p").value);
   const mi=parseFloat(document.getElementById("f-inv").value);
+  const comp=document.getElementById("f-comp").value;
   let n=0;
   rows.forEach(r=>{{
     const isHidden=hiddenSet.has(rowId(r));
+    const compOk = comp===""
+      || (comp==="both" && r.dataset.rev==="Yes" && r.dataset.ocf==="Yes")
+      || (comp==="rev" && r.dataset.rev==="Yes")
+      || (comp==="ocf" && r.dataset.ocf==="Yes");
     const ok=(!q||r.dataset.mgr.includes(q)||r.dataset.ticker.includes(q))
       && num(r,"holdings")<=mh && num(r,"mcap")<=mc*1e6 && num(r,"pct")>=mp
-      && (mi<=0 || num(r,"value")>=mi)
+      && (mi<=0 || num(r,"value")>=mi) && compOk
       && (!isHidden || showHidden);
     r.classList.toggle("hidden-row", isHidden && ok);
     r.style.display=ok?"":"none"; if(ok)n++;
@@ -736,9 +846,10 @@ function sort(k){{
   if(sk===k) sdesc=!sdesc; else {{sk=k; sdesc=NUMCOL.includes(k);}}
   document.querySelectorAll("th").forEach(t=>t.classList.remove("asc","desc"));
   const th=document.querySelector(`th[data-s="${{k}}"]`); if(th)th.classList.add(sdesc?"desc":"asc");
-  const idx={{mgr:0,holdings:1,ticker:2,name:3,pct:4,value:5,buy:6,cur:7,mcap:8}};
+  const idx={{mgr:0,holdings:1,ticker:2,name:3,pct:4,value:5,buy:6,cur:7,mcap:8,rev:9,ocf:10}};
   function val(r){{
     if(NUMCOL.includes(k))return num(r,k);
+    if(k==="rev"||k==="ocf")return r.dataset[k];   // Yes / No / —
     return (r.cells[idx[k]]?.textContent||"").toLowerCase();
   }}
   [...rows].sort((a,b)=>{{const x=val(a),y=val(b);
@@ -750,15 +861,16 @@ function reset(){{
   document.getElementById("f-mc").selectedIndex=0;
   document.getElementById("f-p").value="0";
   document.getElementById("f-inv").selectedIndex=0;
+  document.getElementById("f-comp").value="";
   apply();
 }}
 document.querySelectorAll("th[data-s]").forEach(t=>t.addEventListener("click",()=>sort(t.dataset.s)));
-["f-q","f-h","f-mc","f-p","f-inv"].forEach(id=>document.getElementById(id)
+["f-q","f-h","f-mc","f-p","f-inv","f-comp"].forEach(id=>document.getElementById(id)
   .addEventListener(id==="f-q"?"input":"change",apply));
 
 function copyForSheets(btn){{
   const cols=["Manager","Source","# Holdings","Ticker","Company","% of Fund",
-    "$ Position","Buy Price","Current Price","Market Cap"];
+    "$ Position","Buy Price","Current Price","Market Cap","Rev 2x/5y","OCF 2x/5y"];
   const lines=[cols.join("\\t")];
   const nn=v=>{{const n=parseFloat(v);return (isNaN(n)||n<0)?"":n;}};
   rows.forEach(r=>{{
@@ -769,7 +881,7 @@ function copyForSheets(btn){{
     const mcap=nn(r.dataset.mcap); // in $M
     lines.push([mgr, r.dataset.source, r.dataset.holdings, tk, co,
       nn(r.dataset.pct), nn(r.dataset.value), nn(r.dataset.buy), nn(r.dataset.cur),
-      mcap===""?"":Math.round(mcap*1e6)].join("\\t"));
+      mcap===""?"":Math.round(mcap*1e6), r.dataset.rev, r.dataset.ocf].join("\\t"));
   }});
   const tsv=lines.join("\\n");
   const done=()=>{{const t=btn.textContent;btn.textContent="Copied "+(lines.length-1)+" rows ✓";
@@ -901,6 +1013,29 @@ def main():
 
     n_big = sum(1 for r in rows if (r["pct"] or 0) >= BIG_POSITION)
     print(f"\n[3/3] {len(rows)} small-cap positions ({n_big} are ≥{BIG_POSITION:.0f}% of a fund).")
+
+    # Step 4: revenue & operating-cash-flow doubling (SEC company-facts, ~10yr history)
+    row_tickers = sorted({r["ticker"] for r in rows})
+    print(f"\n[4/4] Checking 5-yr doubling (revenue & OCF) for {len(row_tickers)} stocks via SEC...")
+    dbl = {}
+    _ticker_cik_map()   # warm the ticker->CIK map once
+    dlock = threading.Lock()
+
+    def work_dbl(tk):
+        res = fetch_doubling(tk)
+        with dlock:
+            dbl[tk] = res
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for fut in as_completed({ex.submit(work_dbl, t): t for t in row_tickers}):
+            try:
+                fut.result()
+            except Exception:
+                pass
+    for r in rows:
+        r["rev2x"], r["ocf2x"] = dbl.get(r["ticker"], ("—", "—"))
+    n_comp = sum(1 for r in rows if r["rev2x"] == "Yes" and r["ocf2x"] == "Yes")
+    print(f"  {n_comp} stocks doubled BOTH revenue & OCF over the last 5 years.")
 
     elapsed = time.time() - t0
     out = generate_html(rows, funds, elapsed)
