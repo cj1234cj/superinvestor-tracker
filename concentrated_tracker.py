@@ -646,6 +646,11 @@ def generate_html(rows, mgr_meta, elapsed):
   <div class="fg"><label>Min % of Fund</label><select id="f-p">
     <option value="0" selected>Any</option><option value="5">≥ 5%</option>
     <option value="10">≥ 10% (★)</option><option value="20">≥ 20%</option></select></div>
+  <div class="fg"><label>Min Investment ($)</label><select id="f-inv">
+    <option value="0" selected>Any</option><option value="1000000">≥ $1M</option>
+    <option value="5000000">≥ $5M</option><option value="10000000">≥ $10M</option>
+    <option value="25000000">≥ $25M</option><option value="50000000">≥ $50M</option>
+    <option value="100000000">≥ $100M</option></select></div>
   <button class="btn-reset" onclick="reset()">Reset</button>
 </div>
 
@@ -679,42 +684,48 @@ def generate_html(rows, mgr_meta, elapsed):
 
 <script>
 const tb=document.getElementById("tb"), rows=[...tb.querySelectorAll("tr")];
-let sk="pct", sd=-1;
+let sk="", sdesc=true;
+const NUMCOL=["holdings","pct","value","buy","cur","mcap"];
 function num(r,a){{const n=parseFloat(r.dataset[a]);return isNaN(n)?-9999:n;}}
 function apply(){{
   const q=document.getElementById("f-q").value.toLowerCase();
   const mh=parseFloat(document.getElementById("f-h").value);
   const mc=parseFloat(document.getElementById("f-mc").value);
   const mp=parseFloat(document.getElementById("f-p").value);
+  const mi=parseFloat(document.getElementById("f-inv").value);
   let n=0;
   rows.forEach(r=>{{
     const ok=(!q||r.dataset.mgr.includes(q)||r.dataset.ticker.includes(q))
-      && num(r,"holdings")<=mh && num(r,"mcap")<=mc*1e6 && num(r,"pct")>=mp;
+      && num(r,"holdings")<=mh && num(r,"mcap")<=mc*1e6 && num(r,"pct")>=mp
+      && (mi<=0 || num(r,"value")>=mi);
     r.style.display=ok?"":"none"; if(ok)n++;
   }});
   document.getElementById("s-showing").textContent=n;
   document.getElementById("nr").style.display=n===0?"block":"none";
 }}
 function sort(k){{
-  if(sk===k)sd*=-1; else {{sk=k; sd=-1;}}
+  // first click: numbers high->low, text A->Z; click again to reverse
+  if(sk===k) sdesc=!sdesc; else {{sk=k; sdesc=NUMCOL.includes(k);}}
   document.querySelectorAll("th").forEach(t=>t.classList.remove("asc","desc"));
-  const th=document.querySelector(`th[data-s="${{k}}"]`); if(th)th.classList.add(sd===-1?"desc":"asc");
+  const th=document.querySelector(`th[data-s="${{k}}"]`); if(th)th.classList.add(sdesc?"desc":"asc");
   const idx={{mgr:0,holdings:1,ticker:2,name:3,pct:4,value:5,buy:6,cur:7,mcap:8}};
   function val(r){{
-    if(["holdings","pct","mcap","value","buy","cur"].includes(k))return num(r,k);
+    if(NUMCOL.includes(k))return num(r,k);
     return (r.cells[idx[k]]?.textContent||"").toLowerCase();
   }}
-  [...rows].sort((a,b)=>{{const x=val(a),y=val(b);return x<y?sd:x>y?-sd:0;}}).forEach(r=>tb.appendChild(r));
+  [...rows].sort((a,b)=>{{const x=val(a),y=val(b);
+    if(x<y)return sdesc?1:-1; if(x>y)return sdesc?-1:1; return 0;}}).forEach(r=>tb.appendChild(r));
 }}
 function reset(){{
   document.getElementById("f-q").value="";
   document.getElementById("f-h").selectedIndex=0;
   document.getElementById("f-mc").selectedIndex=0;
   document.getElementById("f-p").value="0";
+  document.getElementById("f-inv").selectedIndex=0;
   apply();
 }}
 document.querySelectorAll("th[data-s]").forEach(t=>t.addEventListener("click",()=>sort(t.dataset.s)));
-["f-q","f-h","f-mc","f-p"].forEach(id=>document.getElementById(id)
+["f-q","f-h","f-mc","f-p","f-inv"].forEach(id=>document.getElementById(id)
   .addEventListener(id==="f-q"?"input":"change",apply));
 
 function copyForSheets(btn){{
