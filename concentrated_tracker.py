@@ -101,10 +101,10 @@ def _get_crumb():
 
 
 def _yahoo_quote(sym):
-    """Return (market_cap, current_price) or (None, None)."""
+    """Return (market_cap, current_price, trailing_pe, price_to_sales) or all None."""
     crumb = _get_crumb()
     url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}"
-    params = {"modules": "price", "crumb": crumb}
+    params = {"modules": "price,summaryDetail", "crumb": crumb}
     r = _yf.get(url, params=params, timeout=15)
     if r.status_code == 401 or (r.status_code == 200 and "Invalid Crumb" in r.text):
         global _crumb
@@ -113,28 +113,31 @@ def _yahoo_quote(sym):
         params["crumb"] = _get_crumb()
         r = _yf.get(url, params=params, timeout=15)
     if r.status_code != 200:
-        return None, None
+        return None, None, None, None
     res = r.json().get("quoteSummary", {}).get("result")
     if not res:
-        return None, None
+        return None, None, None, None
     p = res[0].get("price", {})
+    sd = res[0].get("summaryDetail", {})
     return ((p.get("marketCap") or {}).get("raw"),
-            (p.get("regularMarketPrice") or {}).get("raw"))
+            (p.get("regularMarketPrice") or {}).get("raw"),
+            (sd.get("trailingPE") or {}).get("raw"),
+            (sd.get("priceToSalesTrailing12Months") or {}).get("raw"))
 
 
 def fetch_quote(ticker):
-    """Return (market_cap, current_price). Retries with a Yahoo-normalized
+    """Return (market_cap, current_price, pe, ps). Retries with a Yahoo-normalized
     symbol (dot->dash, drop -OLD) so dot-class small caps aren't dropped."""
     try:
         time.sleep(random.uniform(0.15, 0.4))
-        mc, price = _yahoo_quote(ticker)
-        if not mc:
+        q = _yahoo_quote(ticker)
+        if not q[0]:
             alt = ticker.replace(".", "-").replace("-OLD", "")
             if alt != ticker:
-                mc, price = _yahoo_quote(alt)
-        return mc, price
+                q = _yahoo_quote(alt)
+        return q
     except Exception:
-        return None, None
+        return None, None, None, None
 
 
 # ── Dataroma scraping ─────────────────────────────────────────────────
@@ -428,21 +431,25 @@ def _doubled_5yr(series):
 
 
 def fetch_doubling(ticker):
-    """Return (revenue_doubled, ocf_doubled) as 'Yes'/'No'/'—' from SEC company-facts."""
+    """Return (rev_doubled, ocf_doubled, latest_annual_revenue, latest_annual_ocf).
+    Statuses are 'Yes'/'No'/'—'; the latest annual figures feed P/S and P/OCF."""
     cmap = _ticker_cik_map()
     cik = cmap.get(ticker.upper()) or cmap.get(ticker.replace(".", "-").upper()) \
         or cmap.get(ticker.split(".")[0].upper())
     if not cik:
-        return ("—", "—")
+        return ("—", "—", None, None)
     try:
         time.sleep(random.uniform(0.1, 0.3))
         f = _sec.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json",
                      headers=_SEC_UA, timeout=25).json()
         g = f.get("facts", {}).get("us-gaap", {})
-        return (_doubled_5yr(_annual_usd(g, _REV_CONCEPTS)),
-                _doubled_5yr(_annual_usd(g, _OCF_CONCEPTS)))
+        rev = _annual_usd(g, _REV_CONCEPTS)
+        ocf = _annual_usd(g, _OCF_CONCEPTS)
+        latest_rev = rev[max(rev)] if rev else None
+        latest_ocf = ocf[max(ocf)] if ocf else None
+        return (_doubled_5yr(rev), _doubled_5yr(ocf), latest_rev, latest_ocf)
     except Exception:
-        return ("—", "—")
+        return ("—", "—", None, None)
 
 
 def scrape_valuesider_fund(slug):
@@ -605,10 +612,16 @@ def generate_html(rows, mgr_meta, elapsed):
         rv = r.get("rev2x", "—")
         oc = r.get("ocf2x", "—")
         yn = lambda v: f'<span class="yn {("yes" if v=="Yes" else "no" if v=="No" else "na")}">{v}</span>'
+        def ratio(v):
+            return (f"{v:.1f}x", round(v, 2)) if (v is not None and 0 < v < 1000) else ("—", -1)
+        ps_str, ps_val = ratio(r.get("ps"))
+        pe_str, pe_val = ratio(r.get("pe"))
+        pocf_str, pocf_val = ratio(r.get("pocf"))
         body += f"""
         <tr{row_cls} data-mgr="{r['manager'].lower()}" data-ticker="{r['ticker'].lower()}"
             data-holdings="{r['holdings']}" data-pct="{pct_val:.2f}" data-mcap="{mc_val}"
             data-source="{src}" data-value="{val_val}" data-buy="{bp_val}" data-cur="{cp_val}"
+            data-ps="{ps_val}" data-pe="{pe_val}" data-pocf="{pocf_val}"
             data-rev="{rv}" data-ocf="{oc}" data-big="{1 if big else 0}">
           <td class="mgr">{r['manager']} <span class="src {src_short.lower()}" title="{src_title}">{src_short}</span></td>
           <td class="ctr"><span class="badge">{r['holdings']}</span></td>
@@ -619,6 +632,9 @@ def generate_html(rows, mgr_meta, elapsed):
           <td class="ctr">{bp_str}</td>
           <td class="ctr{gain_cls}"{gain_tip}>{cp_str}</td>
           <td class="ctr">{mc_str}</td>
+          <td class="ctr">{ps_str}</td>
+          <td class="ctr">{pe_str}</td>
+          <td class="ctr">{pocf_str}</td>
           <td class="ctr">{yn(rv)}</td>
           <td class="ctr">{yn(oc)}</td>
           <td class="ctr links">
@@ -775,6 +791,9 @@ def generate_html(rows, mgr_meta, elapsed):
       <th class="ctr" data-s="buy" title="Reported price at the manager's 13F filing (Dataroma funds)">Buy Price</th>
       <th class="ctr" data-s="cur" title="Current price from Yahoo Finance — refreshed daily">Current</th>
       <th class="ctr" data-s="mcap">Market Cap</th>
+      <th class="ctr" data-s="ps" title="Price / Sales — trailing-12-month (Yahoo)">P/S</th>
+      <th class="ctr" data-s="pe" title="Price / Earnings — trailing (Yahoo); blank if unprofitable">P/E</th>
+      <th class="ctr" data-s="pocf" title="Price / Operating Cash Flow — market cap ÷ latest annual operating cash flow (SEC)">P/OCF</th>
       <th class="ctr" data-s="rev" title="Yes if revenue at least doubled over the last ~5 years — a near-double (≥1.95×) counts (SEC filings)">Rev 2×/5y</th>
       <th class="ctr" data-s="ocf" title="Yes if operating cash flow at least doubled over the last ~5 years — a near-double (≥1.95×) counts (SEC filings)">OCF 2×/5y</th>
       <th class="ctr">Links</th>
@@ -798,7 +817,7 @@ def generate_html(rows, mgr_meta, elapsed):
 <script>
 const tb=document.getElementById("tb"), rows=[...tb.querySelectorAll("tr")];
 let sk="", sdesc=true;
-const NUMCOL=["holdings","pct","value","buy","cur","mcap"];
+const NUMCOL=["holdings","pct","value","buy","cur","mcap","ps","pe","pocf"];
 function num(r,a){{const n=parseFloat(r.dataset[a]);return isNaN(n)?-9999:n;}}
 
 // --- Hide state (persisted in the browser; survives reloads & daily refreshes) ---
@@ -871,7 +890,7 @@ document.querySelectorAll("th[data-s]").forEach(t=>t.addEventListener("click",()
 
 function copyForSheets(btn){{
   const cols=["Manager","Source","# Holdings","Ticker","Company","% of Fund",
-    "$ Position","Buy Price","Current Price","Market Cap","Rev 2x/5y","OCF 2x/5y"];
+    "$ Position","Buy Price","Current Price","Market Cap","P/S","P/E","P/OCF","Rev 2x/5y","OCF 2x/5y"];
   const lines=[cols.join("\\t")];
   const nn=v=>{{const n=parseFloat(v);return (isNaN(n)||n<0)?"":n;}};
   rows.forEach(r=>{{
@@ -882,7 +901,8 @@ function copyForSheets(btn){{
     const mcap=nn(r.dataset.mcap); // in $M
     lines.push([mgr, r.dataset.source, r.dataset.holdings, tk, co,
       nn(r.dataset.pct), nn(r.dataset.value), nn(r.dataset.buy), nn(r.dataset.cur),
-      mcap===""?"":Math.round(mcap*1e6), r.dataset.rev, r.dataset.ocf].join("\\t"));
+      mcap===""?"":Math.round(mcap*1e6), nn(r.dataset.ps), nn(r.dataset.pe), nn(r.dataset.pocf),
+      r.dataset.rev, r.dataset.ocf].join("\\t"));
   }});
   const tsv=lines.join("\\n");
   const done=()=>{{const t=btn.textContent;btn.textContent="Copied "+(lines.length-1)+" rows ✓";
@@ -981,12 +1001,12 @@ def main():
     lock = threading.Lock()
 
     def work(tk):
-        mc, price = fetch_quote(tk)
+        mc, price, pe, ps = fetch_quote(tk)
         with lock:
             done[0] += 1
             print(f"  {done[0]}/{len(tickers)}  {tk:<8}", end="\r", flush=True)
             if mc:
-                quotes[tk] = {"mcap": mc, "price": price}
+                quotes[tk] = {"mcap": mc, "price": price, "pe": pe, "ps": ps}
 
     with ThreadPoolExecutor(max_workers=3) as ex:
         for f in as_completed({ex.submit(work, t): t for t in tickers}):
@@ -1034,7 +1054,13 @@ def main():
             except Exception:
                 pass
     for r in rows:
-        r["rev2x"], r["ocf2x"] = dbl.get(r["ticker"], ("—", "—"))
+        rv, oc, latest_rev, latest_ocf = dbl.get(r["ticker"], ("—", "—", None, None))
+        r["rev2x"], r["ocf2x"] = rv, oc
+        q = quotes.get(r["ticker"], {})
+        mc = r["mcap"]
+        r["ps"] = q.get("ps") or ((mc / latest_rev) if latest_rev and latest_rev > 0 else None)
+        r["pe"] = q.get("pe") if (q.get("pe") and q.get("pe") > 0) else None
+        r["pocf"] = (mc / latest_ocf) if (latest_ocf and latest_ocf > 0) else None
     n_comp = sum(1 for r in rows if r["rev2x"] == "Yes" and r["ocf2x"] == "Yes")
     print(f"  {n_comp} stocks doubled BOTH revenue & OCF over the last 5 years.")
 
