@@ -267,42 +267,93 @@ def _name_key(s):
     return toks
 
 
+_SQUISH_SUF = ("incorporated", "inc", "corporation", "corp", "company", "companies",
+               "co", "ltd", "limited", "lp", "llp", "llc", "plc", "sa", "ag", "nv",
+               "holdings", "holding", "hldgs", "group", "grp", "trust", "adr",
+               "cl", "class", "the", "com")
+
+
+def _squish(s):
+    """Punctuation/spacing-insensitive key: 'Wix.com Ltd' & 'Wixcom Ltd' -> 'wix'/'wixcom'
+    both reduce toward the same stem after stripping corporate suffixes."""
+    x = re.sub(r"[^a-z0-9]", "", s.lower())
+    changed = True
+    while changed:
+        changed = False
+        for suf in _SQUISH_SUF:
+            if len(x) > len(suf) + 2 and x.endswith(suf):
+                x = x[: -len(suf)]
+                changed = True
+    return x
+
+
+def _sec_fetch(url):
+    return _sec.get(url, headers=_SEC_UA, timeout=20).text
+
+
 def fetch_13f_reported(index_url):
-    """From a SEC 13F filing index URL, return {name_key: {value, shares, price}}."""
+    """From a SEC filing index URL, return {key: {value, shares, price, ticker}}.
+    Handles 13F info tables and, as a fallback, mutual-fund N-PORT filings
+    (which also carry a direct ticker). Keys: 'T:<TICKER>' and issuer-name tokens."""
     try:
-        r = _sec.get(index_url, headers=_SEC_UA, timeout=20)
-        xmls = re.findall(r'href="([^"]+\.xml)"', r.text)
-        info = [x for x in xmls if "xslform13f" not in x.lower() and "primary_doc" not in x.lower()]
-        if not info:
-            return {}
-        url = "https://www.sec.gov" + info[0] if info[0].startswith("/") else info[0]
-        xml = _sec.get(url, headers=_SEC_UA, timeout=20).text
+        page = _sec_fetch(index_url)
+        xmls = re.findall(r'href="([^"]+\.xml)"', page)
+        full = lambda p: ("https://www.sec.gov" + p) if p.startswith("/") else p
         out = {}
-        for b in re.findall(r"<(?:\w+:)?infoTable>(.*?)</(?:\w+:)?infoTable>", xml, re.S):
-            def g(tag):
-                m = re.search(r"<(?:\w+:)?" + tag + r">(.*?)</(?:\w+:)?" + tag + ">", b, re.S)
-                return m.group(1).strip() if m else ""
-            name = g("nameOfIssuer")
-            value = float(re.sub(r"[^0-9.]", "", g("value")) or 0)
-            shares = float(re.sub(r"[^0-9.]", "", g("sshPrnamt")) or 0)
-            if not name or shares <= 0 or value <= 0:
-                continue
+
+        def add(name, ticker, value, shares):
+            if shares <= 0 or value <= 0:
+                return
             price = value / shares
-            # 13F value is in whole $ (post-2023); guard against legacy $-thousands
-            if price < 0.5:
+            if price < 0.5:          # legacy 13F values were in $-thousands
                 value *= 1000
                 price *= 1000
-            toks = _name_key(name)
-            if not toks:
-                continue
-            rec = {"value": value, "shares": shares, "price": price}
-            # aggregate share classes under the same issuer (keep largest position)
-            for key in (" ".join(toks[:2]), toks[0]):
-                if key not in out or value > out[key]["value"]:
-                    out[key] = rec
+            rec = {"value": value, "shares": shares, "price": price, "ticker": ticker}
+            keys = []
+            if ticker:
+                keys.append("T:" + ticker.upper())
+            sq = _squish(name or "")
+            if len(sq) >= 3:
+                keys.append("S:" + sq)
+            toks = _name_key(name or "")
+            if toks:
+                keys += [" ".join(toks[:2]), toks[0]]
+            for k in keys:
+                if k not in out or value > out[k]["value"]:
+                    out[k] = rec
+
+        # 1) 13F info table
+        info = [x for x in xmls if "xslform13f" not in x.lower() and "primary_doc" not in x.lower()]
+        if info:
+            xml = _sec_fetch(full(info[0]))
+            for b in re.findall(r"<(?:\w+:)?infoTable>(.*?)</(?:\w+:)?infoTable>", xml, re.S):
+                def g(tag, bb=b):
+                    m = re.search(r"<(?:\w+:)?" + tag + r">(.*?)</(?:\w+:)?" + tag + ">", bb, re.S)
+                    return m.group(1).strip() if m else ""
+                add(g("nameOfIssuer"), None,
+                    float(re.sub(r"[^0-9.]", "", g("value")) or 0),
+                    float(re.sub(r"[^0-9.]", "", g("sshPrnamt")) or 0))
+            if out:
+                out["__n__"] = len({id(v) for v in out.values()})
+                return out
+
+        # 2) fallback: N-PORT (mutual funds) — has a direct <ticker>
+        prim = [x for x in xmls if x.lower().endswith("primary_doc.xml") and "xsl" not in x.lower()]
+        if prim:
+            xml = _sec_fetch(full(prim[0]))
+            for b in re.findall(r"<invstOrSec>(.*?)</invstOrSec>", xml, re.S):
+                nm = re.search(r"<name>(.*?)</name>", b, re.S)
+                val = re.search(r"<valUSD>(.*?)</valUSD>", b)
+                bal = re.search(r"<balance>(.*?)</balance>", b)
+                tk = re.search(r'<ticker value="([^"]*)"', b)
+                add(nm.group(1).strip() if nm else "",
+                    tk.group(1).strip() if tk and tk.group(1).strip() else None,
+                    float(re.sub(r"[^0-9.]", "", val.group(1)) if val else 0 or 0),
+                    float(re.sub(r"[^0-9.]", "", bal.group(1)) if bal else 0 or 0))
+        out["__n__"] = len({id(v) for v in out.values()})
         return out
     except Exception as e:
-        print(f"    ! SEC 13F {index_url}: {e}")
+        print(f"    ! SEC filing {index_url}: {e}")
         return {}
 
 
@@ -327,20 +378,27 @@ def scrape_valuesider_fund(slug):
         # SEC 13F filing link -> exact value + reported (buy) price per holding
         sm = re.search(r"(/Archives/edgar/data/\d+/[\d-]+-index\.html)", html)
         reported = fetch_13f_reported("https://www.sec.gov" + sm.group(1)) if sm else {}
+        filing_ok = reported.pop("__n__", 0) >= 3   # filing parsed with several holdings
         # top holdings summary: "(TICKER)</a> COMPANY NAME (NN.NN%)" in the HTML
         positions = []
         for tk, mid_txt, pct in re.findall(r"\(([A-Z0-9.\-]{1,6})\)([^(]*?)\(([0-9.]+)%\)", html):
             company = re.sub(r"<[^>]+>", "", mid_txt).strip(" ,-–").title()
             pctf = float(pct)
-            # match this holding to its 13F record by company name
+            # match this holding to its 13F/N-PORT record: ticker, then squished name, then tokens
+            tku = tk.upper().strip()
             keys = _name_key(company)
-            rec = None
-            for key in ([" ".join(keys[:2]), keys[0]] if keys else []):
-                if key in reported:
-                    rec = reported[key]
-                    break
+            rec = reported.get("T:" + tku) or reported.get("S:" + _squish(company))
+            if rec is None:
+                for key in ([" ".join(keys[:2]), keys[0]] if keys else []):
+                    if key in reported:
+                        rec = reported[key]
+                        break
+            # drop positions Valuesider still lists but the latest filing no longer holds
+            if rec is None and filing_ok:
+                print(f"      · dropping stale {tku} from {name[:30]} (not in latest filing)")
+                continue
             positions.append({
-                "ticker": tk.upper().strip(),
+                "ticker": tku,
                 "company": company,
                 "pct": pctf,
                 "value": rec["value"] if rec else ((port_value * pctf / 100.0) if port_value else None),
