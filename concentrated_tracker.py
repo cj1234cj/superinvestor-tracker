@@ -402,6 +402,7 @@ def _annual_usd(gaap, concepts):
             if not s or not e or v is None:
                 continue
             try:
+                v = float(v)
                 days = (date.fromisoformat(e) - date.fromisoformat(s)).days
             except Exception:
                 continue
@@ -581,8 +582,11 @@ def generate_html(rows, mgr_meta, elapsed):
         pct_val = pct if pct is not None else -1
         big = (pct is not None and pct >= BIG_POSITION)
         mc = r["mcap"]
-        mc_str = f"${mc/1e9:,.2f}B" if mc >= 1e9 else f"${mc/1e6:,.0f}M"
-        mc_val = round(mc / 1e6)
+        if mc:
+            mc_str = f"${mc/1e9:,.2f}B" if mc >= 1e9 else f"${mc/1e6:,.0f}M"
+            mc_val = round(mc / 1e6)
+        else:
+            mc_str, mc_val = "—", -1
         val = r.get("value")
         if val:
             val_str = (f"${val/1e9:,.2f}B" if val >= 1e9
@@ -652,7 +656,7 @@ def generate_html(rows, mgr_meta, elapsed):
     html = f"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Concentrated Superinvestor Small-Cap Tracker</title>
+<title>Superinvestor Portfolio Tracker</title>
 <style>
   :root {{ --bg:#fff; --bg2:#f6f8fa; --bg3:#eaeef2; --border:#d0d7de;
     --text:#1f2328; --muted:#656d76; --blue:#0969da; --green:#1a7f37;
@@ -738,16 +742,15 @@ def generate_html(rows, mgr_meta, elapsed):
     <button class="btn2" onclick="copyForSheets(this)" title="Copy the visible rows as tab-separated text — paste straight into Google Sheets">⧉ Copy for Sheets</button>
     <button class="btn2 ghost" onclick="location.reload()" title="Reload to pull the latest data (auto-refreshed daily)">⟳ Refresh</button>
   </div>
-  <h1>Concentrated Superinvestor — Small-Cap Tracker</h1>
-  <p>Positions held by focused fund managers, filtered to small caps:
-    <span class="tag">Manager holds ≤ {MAX_HOLDINGS} stocks</span>
-    <span class="tag">Stock market cap &lt; $3B</span>
+  <h1>Superinvestor Portfolio Tracker</h1>
+  <p>Every holding of every Dataroma &amp; Valuesider superinvestor — use the filters to narrow by
+    concentration, size, valuation or growth.
     <span class="tag gold">★ = ≥ {BIG_POSITION:.0f}% of the fund</span>
   </p>
   <div class="stats">
-    <div class="stat"><div class="stat-v" id="s-total">{n_rows}</div><div class="stat-l">Small-Cap Positions</div></div>
+    <div class="stat"><div class="stat-v" id="s-total">{n_rows}</div><div class="stat-l">Total Positions</div></div>
     <div class="stat"><div class="stat-v gold">{n_big}</div><div class="stat-l">★ High-Conviction (≥{BIG_POSITION:.0f}%)</div></div>
-    <div class="stat"><div class="stat-v">{n_mgrs}</div><div class="stat-l">Concentrated Managers</div></div>
+    <div class="stat"><div class="stat-v">{n_mgrs}</div><div class="stat-l">Managers</div></div>
     <div class="stat"><div class="stat-v" id="s-showing">{n_rows}</div><div class="stat-l">Showing</div></div>
     <div class="stat"><div class="stat-v" style="font-size:13px">{now}</div><div class="stat-l">Data as of · refreshes daily</div></div>
   </div>
@@ -756,11 +759,14 @@ def generate_html(rows, mgr_meta, elapsed):
 <div class="filters">
   <div class="fg"><label>Search</label><input id="f-q" type="text" placeholder="Manager or ticker..."/></div>
   <div class="fg"><label>Max Holdings</label><select id="f-h">
-    <option value="20">≤ 20 (all)</option><option value="15">≤ 15</option>
-    <option value="10">≤ 10</option><option value="5">≤ 5</option></select></div>
+    <option value="9999" selected>Any</option><option value="20">≤ 20</option>
+    <option value="15">≤ 15</option><option value="10">≤ 10</option>
+    <option value="5">≤ 5</option></select></div>
   <div class="fg"><label>Max Market Cap</label><select id="f-mc">
-    <option value="3000">&lt; $3B (all)</option><option value="2000">&lt; $2B</option>
-    <option value="1000">&lt; $1B</option><option value="500">&lt; $500M</option></select></div>
+    <option value="99000000" selected>Any</option><option value="50000">&lt; $50B</option>
+    <option value="10000">&lt; $10B</option><option value="3000">&lt; $3B</option>
+    <option value="2000">&lt; $2B</option><option value="1000">&lt; $1B</option>
+    <option value="500">&lt; $500M</option></select></div>
   <div class="fg"><label>Min % of Fund</label><select id="f-p">
     <option value="0" selected>Any</option><option value="5">≥ 5%</option>
     <option value="10">≥ 10% (★)</option><option value="20">≥ 20%</option></select></div>
@@ -852,7 +858,7 @@ function apply(){{
       || (comp==="rev" && r.dataset.rev==="Yes")
       || (comp==="ocf" && r.dataset.ocf==="Yes");
     const ok=(!q||r.dataset.mgr.includes(q)||r.dataset.ticker.includes(q))
-      && num(r,"holdings")<=mh && num(r,"mcap")<=mc*1e6 && num(r,"pct")>=mp
+      && num(r,"holdings")<=mh && num(r,"mcap")<=mc && num(r,"pct")>=mp
       && (mi<=0 || num(r,"value")>=mi) && compOk
       && (!isHidden || showHidden);
     r.classList.toggle("hidden-row", isHidden && ok);
@@ -872,8 +878,12 @@ function sort(k){{
     if(k==="rev"||k==="ocf")return r.dataset[k];   // Yes / No / —
     return (r.cells[idx[k]]?.textContent||"").toLowerCase();
   }}
-  [...rows].sort((a,b)=>{{const x=val(a),y=val(b);
-    if(x<y)return sdesc?1:-1; if(x>y)return sdesc?-1:1; return 0;}}).forEach(r=>tb.appendChild(r));
+  const sorted=[...rows].sort((a,b)=>{{const x=val(a),y=val(b);
+    if(x<y)return sdesc?1:-1; if(x>y)return sdesc?-1:1; return 0;}});
+  const parent=tb.parentNode, next=tb.nextSibling;
+  parent.removeChild(tb);              // detach tbody -> reorder off-layout
+  sorted.forEach(r=>tb.appendChild(r));
+  parent.insertBefore(tb, next);       // one reflow on reattach
 }}
 function reset(){{
   document.getElementById("f-q").value="";
@@ -972,10 +982,10 @@ def main():
         vs_data = scrape_valuesider_only(dr_names)
         save_cache(vs_data, VS_CACHE_FILE, "Valuesider")
 
-    # Step 2: unify concentrated funds from both sources
+    # Step 2: unify ALL funds from both sources (every stock in every portfolio)
     funds = []
     for mid, d in holdings.items():
-        if 0 < len(d["positions"]) <= MAX_HOLDINGS:
+        if len(d["positions"]) > 0:
             funds.append({
                 "name": d["name"], "source": "Dataroma",
                 "holdings": len(d["positions"]),
@@ -983,7 +993,7 @@ def main():
                 "positions": d["positions"],
             })
     for slug, d in vs_data.items():
-        if 0 < d["count"] <= MAX_HOLDINGS:
+        if d["count"] > 0 and d["positions"]:
             funds.append({
                 "name": d["name"], "source": "Valuesider",
                 "holdings": d["count"],
@@ -992,7 +1002,7 @@ def main():
             })
     n_dr = sum(1 for f in funds if f["source"] == "Dataroma")
     n_vs = sum(1 for f in funds if f["source"] == "Valuesider")
-    print(f"\n  {len(funds)} concentrated funds (<= {MAX_HOLDINGS} holdings): {n_dr} Dataroma + {n_vs} Valuesider-only.")
+    print(f"\n  {len(funds)} funds (all holdings): {n_dr} Dataroma + {n_vs} Valuesider-only.")
 
     tickers = sorted({p["ticker"] for f in funds for p in f["positions"]})
     print(f"\n[2/3] Fetching market cap + current price for {len(tickers)} tickers (Yahoo, live)...")
@@ -1016,24 +1026,23 @@ def main():
                 pass
     print()
 
-    # Step 3: build rows (positions under the mcap ceiling)
+    # Step 3: build rows — EVERY position of every portfolio (no size/concentration cutoff)
     rows = []
     for f in funds:
         for p in f["positions"]:
-            q = quotes.get(p["ticker"])
-            if q and q["mcap"] < MCAP_CEILING:
-                rows.append({
-                    "manager": f["name"], "source": f["source"],
-                    "holdings": f["holdings"], "fund_url": f["fund_url"],
-                    "ticker": p["ticker"], "company": p["company"],
-                    "pct": p["pct"], "value": p.get("value"),
-                    "value_exact": p.get("value_exact", True),
-                    "buy_price": p.get("buy_price"), "cur_price": q.get("price"),
-                    "mcap": q["mcap"],
-                })
+            q = quotes.get(p["ticker"]) or {}
+            rows.append({
+                "manager": f["name"], "source": f["source"],
+                "holdings": f["holdings"], "fund_url": f["fund_url"],
+                "ticker": p["ticker"], "company": p["company"],
+                "pct": p["pct"], "value": p.get("value"),
+                "value_exact": p.get("value_exact", True),
+                "buy_price": p.get("buy_price"), "cur_price": q.get("price"),
+                "mcap": q.get("mcap"),
+            })
 
     n_big = sum(1 for r in rows if (r["pct"] or 0) >= BIG_POSITION)
-    print(f"\n[3/3] {len(rows)} small-cap positions ({n_big} are ≥{BIG_POSITION:.0f}% of a fund).")
+    print(f"\n[3/3] {len(rows)} total positions ({n_big} are ≥{BIG_POSITION:.0f}% of a fund).")
 
     # Step 4: revenue & operating-cash-flow doubling (SEC company-facts, ~10yr history)
     row_tickers = sorted({r["ticker"] for r in rows})
@@ -1047,20 +1056,30 @@ def main():
         with dlock:
             dbl[tk] = res
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         for fut in as_completed({ex.submit(work_dbl, t): t for t in row_tickers}):
             try:
                 fut.result()
             except Exception:
                 pass
+    def _num(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
     for r in rows:
         rv, oc, latest_rev, latest_ocf = dbl.get(r["ticker"], ("—", "—", None, None))
         r["rev2x"], r["ocf2x"] = rv, oc
         q = quotes.get(r["ticker"], {})
-        mc = r["mcap"]
-        r["ps"] = q.get("ps") or ((mc / latest_rev) if latest_rev and latest_rev > 0 else None)
-        r["pe"] = q.get("pe") if (q.get("pe") and q.get("pe") > 0) else None
-        r["pocf"] = (mc / latest_ocf) if (latest_ocf and latest_ocf > 0) else None
+        mc = _num(r["mcap"])
+        pe = _num(q.get("pe"))
+        ps = _num(q.get("ps"))
+        latest_rev = _num(latest_rev)
+        latest_ocf = _num(latest_ocf)
+        r["ps"] = ps if (ps and ps > 0) else ((mc / latest_rev) if (mc and latest_rev and latest_rev > 0) else None)
+        r["pe"] = pe if (pe and pe > 0) else None
+        r["pocf"] = (mc / latest_ocf) if (mc and latest_ocf and latest_ocf > 0) else None
     n_comp = sum(1 for r in rows if r["rev2x"] == "Yes" and r["ocf2x"] == "Yes")
     print(f"  {n_comp} stocks doubled BOTH revenue & OCF over the last 5 years.")
 
