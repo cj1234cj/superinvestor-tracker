@@ -131,10 +131,13 @@ def fetch_quote(ticker):
     try:
         time.sleep(random.uniform(0.15, 0.4))
         q = _yahoo_quote(ticker)
-        if not q[0]:
+        if not q[0] and not q[1]:
             alt = ticker.replace(".", "-").replace("-OLD", "")
             if alt != ticker:
                 q = _yahoo_quote(alt)
+        if not q[0] and not q[1]:          # got nothing -> transient throttle, retry once
+            time.sleep(random.uniform(0.7, 1.4))
+            q = _yahoo_quote(ticker)
         return q
     except Exception:
         return None, None, None, None
@@ -632,11 +635,12 @@ def generate_html(rows, mgr_meta, elapsed):
             data-holdings="{r['holdings']}" data-pct="{pct_val:.2f}" data-mcap="{mc_val}"
             data-source="{src}" data-value="{val_val}" data-buy="{bp_val}" data-cur="{cp_val}"
             data-ps="{ps_val}" data-pe="{pe_val}" data-pocf="{pocf_val}"
-            data-rev="{rv}" data-ocf="{oc}" data-big="{1 if big else 0}">
+            data-owners="{r.get('owners', 1)}" data-rev="{rv}" data-ocf="{oc}" data-big="{1 if big else 0}">
           <td class="mgr">{r['manager']} <span class="src {src_short.lower()}" title="{src_title}">{src_short}</span></td>
           <td class="ctr"><span class="badge">{r['holdings']}</span></td>
           <td><a class="tk" href="https://finance.yahoo.com/quote/{r['ticker']}" target="_blank">{r['ticker']}</a></td>
           <td class="name" title="{r['company']}">{r['company']}</td>
+          <td class="ctr"><span class="badge owners">{r.get('owners', 1)}</span></td>
           <td class="ctr pct">{star}{pct_str}</td>
           <td class="ctr">{val_str}{val_est}</td>
           <td class="ctr">{bp_str}</td>
@@ -728,6 +732,7 @@ def generate_html(rows, mgr_meta, elapsed):
   .pct {{ font-weight:700; }}
   .badge {{ background:rgba(88,166,255,.15); color:var(--blue); border:1px solid rgba(88,166,255,.3);
     padding:1px 9px; border-radius:10px; font-size:11px; font-weight:700; }}
+  .badge.owners {{ background:rgba(130,80,223,.12); color:var(--purple); border-color:rgba(130,80,223,.3); }}
   .star {{ color:var(--gold); }}
   .est {{ color:var(--muted); font-size:11px; }}
   .up {{ color:var(--green); font-weight:600; }}
@@ -798,6 +803,7 @@ def generate_html(rows, mgr_meta, elapsed):
       <th class="ctr" data-s="holdings"># Holdings</th>
       <th data-s="ticker">Ticker</th>
       <th data-s="name">Company</th>
+      <th class="ctr" data-s="owners" title="How many tracked managers hold this stock">Owners</th>
       <th class="ctr" data-s="pct">% of Fund</th>
       <th class="ctr" data-s="value" title="Dollar size of the position at the latest 13F filing">$ Position</th>
       <th class="ctr" data-s="buy" title="Reported price at the manager's 13F filing (Dataroma funds)">Buy Price</th>
@@ -829,7 +835,7 @@ def generate_html(rows, mgr_meta, elapsed):
 <script>
 const tb=document.getElementById("tb"), rows=[...tb.querySelectorAll("tr")];
 let sk="", sdesc=true;
-const NUMCOL=["holdings","pct","value","buy","cur","mcap","ps","pe","pocf"];
+const NUMCOL=["holdings","owners","pct","value","buy","cur","mcap","ps","pe","pocf"];
 function num(r,a){{const n=parseFloat(r.dataset[a]);return isNaN(n)?-9999:n;}}
 
 // --- Hide state (persisted in the browser; survives reloads & daily refreshes) ---
@@ -905,7 +911,7 @@ document.querySelectorAll("th[data-s]").forEach(t=>t.addEventListener("click",()
   .addEventListener(id==="f-q"?"input":"change",apply));
 
 function copyForSheets(btn){{
-  const cols=["Manager","Source","# Holdings","Ticker","Company","% of Fund",
+  const cols=["Manager","Source","# Holdings","Ticker","Company","Owners","% of Fund",
     "$ Position","Buy Price","Current Price","Market Cap","P/S","P/E","P/OCF","Rev 2x/5y","OCF 2x/5y"];
   const lines=[cols.join("\\t")];
   const nn=v=>{{const n=parseFloat(v);return (isNaN(n)||n<0)?"":n;}};
@@ -915,7 +921,7 @@ function copyForSheets(btn){{
     const tk=r.cells[2].textContent.trim();
     const co=r.cells[3].textContent.trim();
     const mcap=nn(r.dataset.mcap); // in $M
-    lines.push([mgr, r.dataset.source, r.dataset.holdings, tk, co,
+    lines.push([mgr, r.dataset.source, r.dataset.holdings, tk, co, r.dataset.owners,
       nn(r.dataset.pct), nn(r.dataset.value), nn(r.dataset.buy), nn(r.dataset.cur),
       mcap===""?"":Math.round(mcap*1e6), nn(r.dataset.ps), nn(r.dataset.pe), nn(r.dataset.pocf),
       r.dataset.rev, r.dataset.ocf].join("\\t"));
@@ -1010,27 +1016,46 @@ def main():
     n_vs = sum(1 for f in funds if f["source"] == "Valuesider")
     print(f"\n  {len(funds)} funds (all holdings): {n_dr} Dataroma + {n_vs} Valuesider-only.")
 
-    tickers = sorted({p["ticker"] for f in funds for p in f["positions"]})
+    # How many distinct managers hold each stock
+    owners = {}
+    for f in funds:
+        for p in f["positions"]:
+            owners.setdefault(p["ticker"], set()).add(f["name"])
+    owner_count = {tk: len(mgrs) for tk, mgrs in owners.items()}
+
+    tickers = sorted(owners.keys())
     print(f"\n[2/3] Fetching market cap + current price for {len(tickers)} tickers (Yahoo, live)...")
     quotes = {}
-    done = [0]
     lock = threading.Lock()
 
     def work(tk):
         mc, price, pe, ps = fetch_quote(tk)
         with lock:
-            done[0] += 1
-            print(f"  {done[0]}/{len(tickers)}  {tk:<8}", end="\r", flush=True)
-            if mc:
+            if mc or price:               # keep price even for ETFs (no market cap)
                 quotes[tk] = {"mcap": mc, "price": price, "pe": pe, "ps": ps}
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        for f in as_completed({ex.submit(work, t): t for t in tickers}):
-            try:
-                f.result()
-            except Exception:
-                pass
-    print()
+    def run_quotes(tks, workers):
+        done = [0]
+        def w(tk):
+            work(tk)
+            with lock:
+                done[0] += 1
+                print(f"  {done[0]}/{len(tks)}  {tk:<8}", end="\r", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for f in as_completed({ex.submit(w, t): t for t in tks}):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+        print()
+
+    run_quotes(tickers, 4)
+    missing = [t for t in tickers if t not in quotes]      # recover throttled ones
+    if missing:
+        print(f"  Retrying {len(missing)} tickers that failed (slower)...")
+        time.sleep(3)
+        run_quotes(missing, 2)
+    print(f"  Got quotes for {len(quotes)}/{len(tickers)} tickers.")
 
     # Step 3: build rows — EVERY position of every portfolio (no size/concentration cutoff)
     rows = []
@@ -1041,6 +1066,7 @@ def main():
                 "manager": f["name"], "source": f["source"],
                 "holdings": f["holdings"], "fund_url": f["fund_url"],
                 "ticker": p["ticker"], "company": p["company"],
+                "owners": owner_count.get(p["ticker"], 1),
                 "pct": p["pct"], "value": p.get("value"),
                 "value_exact": p.get("value_exact", True),
                 "buy_price": p.get("buy_price"), "cur_price": q.get("price"),
